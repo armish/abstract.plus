@@ -1717,18 +1717,16 @@ def get_stats():
     })
 
 if __name__ == '__main__':
+    # Get host and port from environment variables with defaults
+    host = os.environ.get('HOST', '127.0.0.1')
+    port = int(os.environ.get('PORT', 5000))
+
     print("\n" + "="*50)
     print("ESMO 2025 Abstract Annotator")
     print("="*50)
     print("\nStarting web server...")
-    print("Open your browser and go to: http://127.0.0.1:5000")
+    print(f"Open your browser and go to: http://{host}:{port}")
     print("\nPress CTRL+C to stop the server\n")
 
-    # Try different host configurations
-    try:
-        # First try with 127.0.0.1
-        app.run(debug=True, host='127.0.0.1', port=5000)
-    except:
-        # If that fails, try with 0.0.0.0
-        print("\nTrying alternative configuration...")
-        app.run(debug=True, host='0.0.0.0', port=5000)
+    # Run with configured host and port
+    app.run(debug=True, host=host, port=port)
