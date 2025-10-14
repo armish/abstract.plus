@@ -103,6 +103,7 @@ pip install -r requirements.txt
 
 ### Starting the Application
 
+**Basic Usage:**
 ```bash
 # If using conda
 conda activate conference-annotator
@@ -111,6 +112,18 @@ python conference-webapp.py
 # If using venv
 source venv/bin/activate  # On macOS/Linux
 python conference-webapp.py
+```
+
+**Custom Host and Port:**
+```bash
+# Run on a different port
+PORT=8080 python conference-webapp.py
+
+# Bind to all interfaces (required for deployment)
+HOST=0.0.0.0 PORT=8080 python conference-webapp.py
+
+# With OpenAI API key
+OPENAI_API_KEY='sk-your-key' HOST=0.0.0.0 PORT=8000 python conference-webapp.py
 ```
 
 The application will start and display:
@@ -125,7 +138,12 @@ Open your browser and go to: http://127.0.0.1:5000
 Press CTRL+C to stop the server
 ```
 
-Open your browser and navigate to `http://127.0.0.1:5000`
+**Environment Variables:**
+- `HOST` - Server host (default: `127.0.0.1`). Use `0.0.0.0` for deployment
+- `PORT` - Server port (default: `5000`)
+- `OPENAI_API_KEY` - Your OpenAI API key (optional)
+
+Open your browser and navigate to the displayed URL (default: `http://127.0.0.1:5000`)
 
 ### Searching Abstracts
 
@@ -212,7 +230,7 @@ Approximate costs (as of 2025):
 
 ### Port already in use
 - Stop any other processes using port 5000
-- Or modify the port in `conference-webapp.py` line 1740
+- Or run with a custom port: `PORT=8080 python conference-webapp.py`
 
 ### Data not loading properly
 - Verify Excel file format matches expected columns

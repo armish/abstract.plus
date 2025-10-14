@@ -3,14 +3,6 @@
 ESMO 2025 Abstract Annotator - Conference Web Application
 Run this single file to start the web application.
 
-Requirements (install with pip):
-- Flask==2.3.3
-- flask-cors==4.0.0
-- pandas==2.0.3
-- openpyxl==3.1.2
-- openai>=2.0.0
-- Werkzeug==2.3.7
-
 Usage:
     python conference-webapp.py
 """
@@ -575,7 +567,7 @@ HTML_TEMPLATE = """
             
             <div class="control-group">
                 <label for="questionInput">Annotation Question:</label>
-                <textarea id="questionInput" placeholder="Enter the question you want to ask about each abstract..."></textarea>
+                <textarea id="questionInput" placeholder="Enter the question you want to ask about each abstract (e.g. what is the treatment modality?)"></textarea>
             </div>
             
             <div class="advanced-settings">
