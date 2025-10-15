@@ -1713,12 +1713,19 @@ if __name__ == '__main__':
     host = os.environ.get('HOST', '127.0.0.1')
     port = int(os.environ.get('PORT', 5000))
 
+    # Get debug mode from environment (default to False for production)
+    debug = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
+
     print("\n" + "="*50)
     print("ESMO 2025 Abstract Annotator")
     print("="*50)
     print("\nStarting web server...")
+    print(f"Mode: {'Development (Debug)' if debug else 'Production'}")
     print(f"Open your browser and go to: http://{host}:{port}")
+    if not debug:
+        print("\nWARNING: Using Flask's built-in server in production is not recommended.")
+        print("For production, use: gunicorn -w 4 -b 0.0.0.0:5000 conference-webapp:app")
     print("\nPress CTRL+C to stop the server\n")
 
     # Run with configured host and port
-    app.run(debug=True, host=host, port=port)
+    app.run(debug=debug, host=host, port=port)

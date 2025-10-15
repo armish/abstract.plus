@@ -141,9 +141,79 @@ Press CTRL+C to stop the server
 **Environment Variables:**
 - `HOST` - Server host (default: `127.0.0.1`). Use `0.0.0.0` for deployment
 - `PORT` - Server port (default: `5000`)
+- `FLASK_DEBUG` - Enable debug mode (`True` or `False`, default: `False`)
 - `OPENAI_API_KEY` - Your OpenAI API key (optional)
 
 Open your browser and navigate to the displayed URL (default: `http://127.0.0.1:5000`)
+
+### Production Deployment
+
+For production environments, use **Gunicorn** instead of Flask's built-in development server:
+
+**Install Gunicorn** (already in requirements.txt):
+```bash
+pip install -r requirements.txt
+```
+
+**Run with Gunicorn:**
+```bash
+# Basic production server with 4 worker processes
+gunicorn -w 4 -b 0.0.0.0:5000 conference-webapp:app
+
+# With environment variables
+OPENAI_API_KEY='sk-your-key' gunicorn -w 4 -b 0.0.0.0:5000 conference-webapp:app
+
+# With timeout for long-running annotation requests
+gunicorn -w 4 -b 0.0.0.0:5000 --timeout 300 conference-webapp:app
+
+# With access logging
+gunicorn -w 4 -b 0.0.0.0:5000 --access-logfile - --error-logfile - conference-webapp:app
+```
+
+**Gunicorn Options Explained:**
+- `-w 4` - Number of worker processes (recommendation: 2-4 × number of CPU cores)
+- `-b 0.0.0.0:5000` - Bind to all interfaces on port 5000
+- `--timeout 300` - Worker timeout in seconds (important for long annotation jobs)
+- `--access-logfile -` - Log requests to stdout
+- `--error-logfile -` - Log errors to stdout
+- `conference-webapp:app` - Module name and Flask app variable
+
+**Production Best Practices:**
+1. Use a reverse proxy (nginx or Apache) in front of Gunicorn
+2. Use systemd or supervisor to manage the Gunicorn process
+3. Set appropriate timeouts for long-running annotation tasks
+4. Configure logging for production monitoring
+5. Use HTTPS with SSL/TLS certificates
+6. Set proper file permissions and user privileges
+
+**Example systemd service file** (`/etc/systemd/system/conference-annotator.service`):
+```ini
+[Unit]
+Description=ESMO 2025 Abstract Annotator
+After=network.target
+
+[Service]
+Type=notify
+User=www-data
+WorkingDirectory=/path/to/conference-webapp/2025-ESMO
+Environment="OPENAI_API_KEY=sk-your-key"
+Environment="PATH=/path/to/venv/bin"
+ExecStart=/path/to/venv/bin/gunicorn -w 4 -b 0.0.0.0:5000 --timeout 300 conference-webapp:app
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=5
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start the service:
+```bash
+sudo systemctl enable conference-annotator
+sudo systemctl start conference-annotator
+sudo systemctl status conference-annotator
+```
 
 ### Searching Abstracts
 
