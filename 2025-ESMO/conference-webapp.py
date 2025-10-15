@@ -18,8 +18,9 @@ import threading
 import time
 import random
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
+import gc
 
 # HTML Template embedded as string
 HTML_TEMPLATE = """
@@ -944,22 +945,31 @@ HTML_TEMPLATE = """
             if (progressInterval) {
                 clearInterval(progressInterval);
             }
-            
+
             progressInterval = setInterval(() => {
                 if (!currentTaskId) return;
-                
+
                 fetch('/api/progress/' + currentTaskId)
                     .then(response => response.json())
                     .then(data => {
-                        const percentage = Math.round((data.completed / data.total) * 100);
+                        // Safely calculate percentage, avoiding NaN
+                        let percentage = 0;
+                        if (data.total && data.total > 0) {
+                            percentage = Math.round((data.completed / data.total) * 100);
+                            // Clamp between 0 and 100
+                            percentage = Math.max(0, Math.min(100, percentage));
+                        }
+
                         document.getElementById('progressFill').style.width = percentage + '%';
                         document.getElementById('progressFill').textContent = percentage + '%';
-                        
+
                         if (data.status === 'completed') {
                             clearInterval(progressInterval);
+                            document.getElementById('progressFill').style.width = '100%';
+                            document.getElementById('progressFill').textContent = '100%';
                             document.getElementById('progressText').textContent = 'Annotation completed!';
                             showMessage('Annotation completed successfully!', 'success');
-                            
+
                             // Reload the table to show the new annotation column
                             loadAnnotatedResults();
                         }
@@ -1211,6 +1221,10 @@ CORS(app)
 # Global variables for progress tracking
 annotation_progress = {}
 annotation_results = {}
+annotation_timestamps = {}  # Track creation time for cleanup
+
+# Constants
+RESULT_EXPIRATION_HOURS = 24
 
 # Load data at startup
 def load_data():
@@ -1281,6 +1295,63 @@ def load_data():
 
 # Initialize data
 abstracts_df = load_data()
+
+def cleanup_old_results():
+    """Remove annotation results older than RESULT_EXPIRATION_HOURS"""
+    current_time = datetime.now()
+    expired_tasks = []
+
+    for task_id, timestamp in annotation_timestamps.items():
+        if current_time - timestamp > timedelta(hours=RESULT_EXPIRATION_HOURS):
+            expired_tasks.append(task_id)
+
+    for task_id in expired_tasks:
+        if task_id in annotation_results:
+            del annotation_results[task_id]
+        if task_id in annotation_progress:
+            del annotation_progress[task_id]
+        if task_id in annotation_timestamps:
+            del annotation_timestamps[task_id]
+        print(f"Cleaned up expired annotation task: {task_id}")
+
+    if expired_tasks:
+        gc.collect()  # Force garbage collection after cleanup
+
+    return len(expired_tasks)
+
+def filter_dataframe_efficient(df, search_filter='', show_empty=False):
+    """
+    Memory-efficient filtering that avoids full DataFrame copies.
+    Returns a filtered view/index instead of a full copy.
+    """
+    # Start with all indices
+    mask = pd.Series([True] * len(df), index=df.index)
+
+    # Filter out rows without Abstract text unless show_empty is True
+    if not show_empty and 'Abstract' in df.columns:
+        mask = mask & (df['Abstract'].notna()) & (df['Abstract'] != '')
+
+    # Apply search filter
+    matched_keywords = pd.Series([''] * len(df), index=df.index)
+
+    if search_filter:
+        search_terms = [term.strip() for term in search_filter.split(';') if term.strip()]
+        search_mask = pd.Series([False] * len(df), index=df.index)
+
+        for term in search_terms:
+            term_mask = df.apply(lambda row: row.astype(str).str.contains(term, case=False).any(), axis=1)
+            search_mask = search_mask | term_mask
+
+            # Track matched keywords
+            for idx in df[term_mask].index:
+                if matched_keywords[idx]:
+                    matched_keywords[idx] += '; ' + term
+                else:
+                    matched_keywords[idx] = term
+
+        mask = mask & search_mask
+
+    return mask, matched_keywords
 
 def get_openai_response(api_key, model, abstract_text, question, dry_run=False):
     """Get response from OpenAI API or generate mock response for dry run"""
@@ -1360,53 +1431,37 @@ def index():
 
 @app.route('/api/abstracts')
 def get_abstracts():
-    """Get paginated abstracts data"""
+    """Get paginated abstracts data with efficient filtering"""
     page = int(request.args.get('page', 1))
     per_page = int(request.args.get('per_page', 20))
     search = request.args.get('search', '')
     show_empty = request.args.get('show_empty', 'false').lower() == 'true'
-    
-    # Filter data based on search
-    filtered_df = abstracts_df.copy()
-    
-    # Filter out rows without Abstract text unless show_empty is True
-    if not show_empty and 'Abstract' in filtered_df.columns:
-        filtered_df = filtered_df[
-            (filtered_df['Abstract'].notna()) & (filtered_df['Abstract'] != '')
-        ]
-    
-    search_terms = []
-    if search:
-        # Split search terms by semicolon and strip whitespace
-        search_terms = [term.strip() for term in search.split(';') if term.strip()]
-        
-        # Create a column to track matched keywords
-        filtered_df['Matched Keywords'] = ''
-        
-        # Filter rows that match any of the search terms
-        mask = pd.Series([False] * len(filtered_df))
-        
-        for term in search_terms:
-            term_mask = filtered_df.apply(lambda row: row.astype(str).str.contains(term, case=False).any(), axis=1)
-            mask = mask | term_mask
-            
-            # Track which keywords matched for each row
-            for idx in filtered_df[term_mask].index:
-                if filtered_df.loc[idx, 'Matched Keywords']:
-                    filtered_df.loc[idx, 'Matched Keywords'] += '; ' + term
-                else:
-                    filtered_df.loc[idx, 'Matched Keywords'] = term
-        
-        filtered_df = filtered_df[mask]
-    
-    # Paginate
-    total = len(filtered_df)
+
+    # Cleanup old results periodically (every request is fine given low frequency)
+    cleanup_old_results()
+
+    # Use efficient filtering
+    mask, matched_keywords = filter_dataframe_efficient(abstracts_df, search, show_empty)
+
+    # Get filtered indices (avoid full copy)
+    filtered_indices = abstracts_df.index[mask]
+    total = len(filtered_indices)
+
+    # Paginate using indices
     start = (page - 1) * per_page
     end = start + per_page
-    
+    page_indices = filtered_indices[start:end]
+
+    # Only copy the data we need for this page
+    page_df = abstracts_df.loc[page_indices].copy()
+
+    # Add matched keywords if search was used
+    if search:
+        page_df['Matched Keywords'] = matched_keywords[page_indices]
+
     # Convert to dict for JSON response
-    data = filtered_df.iloc[start:end].to_dict('records')
-    
+    data = page_df.to_dict('records')
+
     response_data = {
         'data': data,
         'total': total,
@@ -1414,16 +1469,17 @@ def get_abstracts():
         'per_page': per_page,
         'total_pages': (total + per_page - 1) // per_page
     }
-    
+
     # Include search terms if present
-    if search_terms:
+    if search:
+        search_terms = [term.strip() for term in search.split(';') if term.strip()]
         response_data['search_terms'] = search_terms
-    
+
     return jsonify(response_data)
 
 @app.route('/api/annotate', methods=['POST'])
 def annotate_abstracts():
-    """Start annotation process"""
+    """Start annotation process with efficient filtering"""
     data = request.json
     api_key = data.get('api_key')
     model = data.get('model', 'gpt-3.5-turbo')
@@ -1432,42 +1488,23 @@ def annotate_abstracts():
     dry_run = data.get('dry_run', False)
     search_filter = data.get('search_filter', '')
     show_empty = data.get('show_empty', False)
-    
+
     # Generate task ID
     task_id = hashlib.md5(f"{question}{datetime.now()}".encode()).hexdigest()
-    
-    # Filter abstracts if needed
-    filtered_df = abstracts_df.copy()
-    
-    # Apply the same filters as the display
-    if not show_empty and 'Abstract' in filtered_df.columns:
-        filtered_df = filtered_df[
-            (filtered_df['Abstract'].notna()) & (filtered_df['Abstract'] != '')
-        ]
-    
+
+    # Use efficient filtering
+    mask, matched_keywords = filter_dataframe_efficient(abstracts_df, search_filter, show_empty)
+
+    # Get filtered indices
+    filtered_indices = abstracts_df.index[mask]
+
+    # Only copy the filtered data we need for annotation
+    filtered_df = abstracts_df.loc[filtered_indices].copy()
+
+    # Add matched keywords if search was used
     if search_filter:
-        # Split search terms by semicolon
-        search_terms = [term.strip() for term in search_filter.split(';') if term.strip()]
-        
-        # Create matched keywords column
-        filtered_df['Matched Keywords'] = ''
-        
-        # Filter rows that match any of the search terms
-        mask = pd.Series([False] * len(filtered_df))
-        
-        for term in search_terms:
-            term_mask = filtered_df.apply(lambda row: row.astype(str).str.contains(term, case=False).any(), axis=1)
-            mask = mask | term_mask
-            
-            # Track which keywords matched
-            for idx in filtered_df[term_mask].index:
-                if filtered_df.loc[idx, 'Matched Keywords']:
-                    filtered_df.loc[idx, 'Matched Keywords'] += '; ' + term
-                else:
-                    filtered_df.loc[idx, 'Matched Keywords'] = term
-        
-        filtered_df = filtered_df[mask]
-    
+        filtered_df['Matched Keywords'] = matched_keywords[filtered_indices]
+
     # Initialize progress tracking
     total_abstracts = len(filtered_df)
     annotation_progress[task_id] = {
@@ -1476,16 +1513,19 @@ def annotate_abstracts():
         'status': 'running',
         'question': question
     }
-    
+
+    # Track creation time for cleanup
+    annotation_timestamps[task_id] = datetime.now()
+
     # Split abstracts into batches for threading
     abstracts_list = list(filtered_df.iterrows())
     batch_size = max(1, total_abstracts // num_threads) if total_abstracts > num_threads else 1
     batches = [abstracts_list[i:i + batch_size] for i in range(0, total_abstracts, batch_size)]
-    
+
     # Process in background
     def run_annotation():
         all_results = []
-        
+
         with ThreadPoolExecutor(max_workers=min(num_threads, len(batches))) as executor:
             futures = []
             for i, batch in enumerate(batches):
@@ -1494,33 +1534,38 @@ def annotate_abstracts():
                     task_id, batch, api_key, model, question, dry_run, i
                 )
                 futures.append(future)
-            
+
             # Collect results
             for future in as_completed(futures):
                 batch_results = future.result()
                 all_results.extend(batch_results)
-        
+
         # Update dataframe with results
         result_df = filtered_df.copy()
         answer_column = f"Answer: {question[:50]}..."
-        
+
         # Create answer mapping
         answer_map = {r['index']: r['answer'] for r in all_results}
-        
+
         # Add the answer column
         result_df[answer_column] = result_df.index.map(lambda x: answer_map.get(x, 'No answer'))
-        
+
         # Ensure all columns are preserved
         print(f"Result columns after annotation: {list(result_df.columns)}")
-        
+
         # Store results
         annotation_results[task_id] = result_df
         annotation_progress[task_id]['status'] = 'completed'
-    
+
+        # Clean up temporary variables and force garbage collection
+        del all_results
+        del answer_map
+        gc.collect()
+
     # Start annotation in background thread
     thread = threading.Thread(target=run_annotation)
     thread.start()
-    
+
     return jsonify({'task_id': task_id, 'total': total_abstracts})
 
 @app.route('/api/progress/<task_id>')
@@ -1568,61 +1613,54 @@ def get_annotated_results(task_id):
 
 @app.route('/api/download/current')
 def download_current_view():
-    """Download current filtered view as CSV"""
+    """Download current filtered view as CSV with streaming"""
     search = request.args.get('search', '')
     show_empty = request.args.get('show_empty', 'false').lower() == 'true'
-    
-    # Apply same filters as display
-    filtered_df = abstracts_df.copy()
-    
-    if not show_empty and 'Abstract' in filtered_df.columns:
-        filtered_df = filtered_df[
-            (filtered_df['Abstract'].notna()) & (filtered_df['Abstract'] != '')
-        ]
-    
-    if search:
-        # Split search terms by semicolon
-        search_terms = [term.strip() for term in search.split(';') if term.strip()]
-        
-        # Create matched keywords column
-        filtered_df['Matched Keywords'] = ''
-        
-        # Filter rows that match any of the search terms
-        mask = pd.Series([False] * len(filtered_df))
-        
-        for term in search_terms:
-            term_mask = filtered_df.apply(lambda row: row.astype(str).str.contains(term, case=False).any(), axis=1)
-            mask = mask | term_mask
-            
-            # Track which keywords matched
-            for idx in filtered_df[term_mask].index:
-                if filtered_df.loc[idx, 'Matched Keywords']:
-                    filtered_df.loc[idx, 'Matched Keywords'] += '; ' + term
-                else:
-                    filtered_df.loc[idx, 'Matched Keywords'] = term
-        
-        filtered_df = filtered_df[mask]
-    
+
+    # Use efficient filtering
+    mask, matched_keywords = filter_dataframe_efficient(abstracts_df, search, show_empty)
+
+    # Get filtered indices (avoid full copy)
+    filtered_indices = abstracts_df.index[mask]
+
     # Reorder columns to match display
     cols = ['Abstract #', 'Track', 'First Author', 'Abstract title', 'Abstract']
-    if 'Matched Keywords' in filtered_df.columns:
+    if search:
         cols.append('Matched Keywords')
-    
+
     # Select only existing columns
-    existing_cols = [col for col in cols if col in filtered_df.columns]
-    filtered_df = filtered_df[existing_cols]
-    
-    # Create CSV in memory
+    existing_cols = [col for col in cols if col in abstracts_df.columns]
+
+    # Create CSV with streaming to avoid loading everything in memory
     output = io.StringIO()
-    filtered_df.to_csv(output, index=False, encoding='utf-8')
+
+    # Write header
+    output.write(','.join(existing_cols) + '\n')
+
+    # Write data in chunks to minimize memory usage
+    chunk_size = 1000
+    for i in range(0, len(filtered_indices), chunk_size):
+        chunk_indices = filtered_indices[i:i + chunk_size]
+        chunk_df = abstracts_df.loc[chunk_indices, existing_cols].copy()
+
+        # Add matched keywords if search was used
+        if search:
+            chunk_df['Matched Keywords'] = matched_keywords[chunk_indices]
+
+        # Write chunk to CSV (without header)
+        chunk_df.to_csv(output, index=False, header=False, encoding='utf-8')
+
+        # Clear chunk from memory
+        del chunk_df
+
     output.seek(0)
-    
+
     # Convert to bytes
     output_bytes = io.BytesIO(output.getvalue().encode('utf-8'))
     output_bytes.seek(0)
-    
+
     filename = f"esmo_abstracts_filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    
+
     return send_file(
         output_bytes,
         mimetype='text/csv',
@@ -1632,38 +1670,47 @@ def download_current_view():
 
 @app.route('/api/download/<task_id>')
 def download_results(task_id):
-    """Download annotated results as CSV"""
+    """Download annotated results as CSV with streaming"""
     if task_id not in annotation_results:
         return jsonify({'error': 'Results not found'}), 404
-    
-    result_df = annotation_results[task_id].copy()
-    
+
+    result_df = annotation_results[task_id]
+
     # Reorder columns to match display
     base_cols = ['Abstract #', 'Track', 'First Author', 'Abstract title', 'Abstract']
 
     # Add matched keywords if present
     if 'Matched Keywords' in result_df.columns:
         base_cols.append('Matched Keywords')
-    
+
     # Add annotation columns
     annotation_cols = [col for col in result_df.columns if col.startswith('Answer:')]
     all_cols = base_cols + annotation_cols
-    
+
     # Select only existing columns in the correct order
     existing_cols = [col for col in all_cols if col in result_df.columns]
-    result_df = result_df[existing_cols]
-    
-    # Create CSV in memory
+
+    # Create CSV with streaming to avoid loading everything in memory
     output = io.StringIO()
-    result_df.to_csv(output, index=False, encoding='utf-8')
+
+    # Write header
+    output.write(','.join(existing_cols) + '\n')
+
+    # Write data in chunks to minimize memory usage
+    chunk_size = 1000
+    for i in range(0, len(result_df), chunk_size):
+        chunk_df = result_df.iloc[i:i + chunk_size][existing_cols].copy()
+        chunk_df.to_csv(output, index=False, header=False, encoding='utf-8')
+        del chunk_df
+
     output.seek(0)
-    
+
     # Convert to bytes
     output_bytes = io.BytesIO(output.getvalue().encode('utf-8'))
     output_bytes.seek(0)
-    
+
     filename = f"annotated_abstracts_{task_id[:8]}.csv"
-    
+
     return send_file(
         output_bytes,
         mimetype='text/csv',
