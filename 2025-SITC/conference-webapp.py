@@ -975,15 +975,29 @@ HTML_TEMPLATE = """
                 fetch('/api/progress/' + currentTaskId)
                     .then(response => response.json())
                     .then(data => {
+                        // Check if data is valid and avoid NaN
+                        if (!data || !data.total || data.total === 0) {
+                            return;
+                        }
+
                         const percentage = Math.round((data.completed / data.total) * 100);
+
+                        // Ensure percentage is a valid number
+                        if (isNaN(percentage)) {
+                            return;
+                        }
+
                         document.getElementById('progressFill').style.width = percentage + '%';
                         document.getElementById('progressFill').textContent = percentage + '%';
-                        
+                        document.getElementById('progressText').textContent = 'Processing ' + data.completed + ' of ' + data.total + ' abstracts...';
+
                         if (data.status === 'completed') {
                             clearInterval(progressInterval);
+                            document.getElementById('progressFill').style.width = '100%';
+                            document.getElementById('progressFill').textContent = '100%';
                             document.getElementById('progressText').textContent = 'Annotation completed!';
                             showMessage('Annotation completed successfully!', 'success');
-                            
+
                             // Reload the table to show the new annotation column
                             loadAnnotatedResults();
                         }
@@ -1246,6 +1260,7 @@ CORS(app)
 # Global variables for progress tracking
 annotation_progress = {}
 annotation_results = {}
+progress_lock = threading.Lock()
 
 # Load data at startup
 def load_data():
@@ -1307,6 +1322,10 @@ abstracts_df = load_data()
 
 def get_openai_response(api_key, model, abstract_text, question, dry_run=False):
     """Get response from OpenAI API or generate mock response for dry run"""
+    # Quick return for empty abstracts
+    if not abstract_text or abstract_text.strip() == '' or abstract_text == '0':
+        return "No abstract available"
+
     if dry_run:
         # Generate random responses for dry run
         responses = [
@@ -1338,7 +1357,8 @@ Answer:"""
             messages=[
                 {"role": "system", "content": "You are a helpful assistant analyzing medical abstracts. Provide concise, factual answers based only on the information in the abstract."},
                 {"role": "user", "content": prompt}
-            ]
+            ],
+            timeout=30.0  # Add 30 second timeout to prevent hanging
         )
 
         return response.choices[0].message.content.strip()
@@ -1348,30 +1368,31 @@ Answer:"""
 def process_abstracts_batch(task_id, abstracts_batch, api_key, model, question, dry_run, thread_id):
     """Process a batch of abstracts"""
     results = []
-    
+
     for idx, (index, row) in enumerate(abstracts_batch):
+        answer = None
         try:
             abstract_text = row.get('Abstract', '')
-            if not abstract_text:
+            if not abstract_text or abstract_text == '' or abstract_text == '0':
                 answer = "No abstract available"
             else:
                 answer = get_openai_response(api_key, model, abstract_text, question, dry_run)
-            
+
             results.append({
                 'index': index,
                 'answer': answer
             })
-            
-            # Update progress
-            with threading.Lock():
-                annotation_progress[task_id]['completed'] += 1
-                
+
         except Exception as e:
             results.append({
                 'index': index,
                 'answer': f"Error: {str(e)}"
             })
-    
+        finally:
+            # Always update progress, even if there's an error
+            with progress_lock:
+                annotation_progress[task_id]['completed'] += 1
+
     return results
 
 @app.route('/')
