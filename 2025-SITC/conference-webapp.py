@@ -783,15 +783,17 @@ HTML_TEMPLATE = """
             const messageEl = document.getElementById('message');
             messageEl.className = type;
             messageEl.textContent = message;
-            
+
             // Add download button if annotation is complete
             if (message.includes('completed successfully') && currentTaskId) {
                 messageEl.innerHTML = message + ' <button class="btn-success" style="margin-left: 10px;" onclick="downloadResults()">Download Now</button>';
+                // Don't auto-hide the download button message
+                return;
             }
-            
+
             setTimeout(() => {
                 messageEl.textContent = '';
-            }, 10000); // Show for longer when download is available
+            }, 10000);
         }
         
         function loadStats() {
@@ -1025,39 +1027,39 @@ HTML_TEMPLATE = """
                     
                     currentPage = data.page;
                     totalPages = data.total_pages;
-                    
-                    // Update table headers if new columns exist
+
+                    // Always update table headers to include annotation columns
+                    const thead = document.querySelector('#abstractsTable thead tr');
+                    thead.innerHTML = '';
+
+                    // Add standard columns for SITC
+                    const standardColumns = [
+                        {name: 'Abstract #', field: 'Abstract #'},
+                        {name: 'Keywords', field: 'Keywords'},
+                        {name: 'Primary Category', field: 'Primary Category'},
+                        {name: 'Presentation Type', field: 'Presentation Type'},
+                        {name: 'Author', field: 'First Author'},
+                        {name: 'Abstract Title', field: 'Abstract title'},
+                        {name: 'Abstract', field: 'Abstract'},
+                        {name: 'Link', field: 'Link'}
+                    ];
+
+                    standardColumns.forEach(col => {
+                        const th = document.createElement('th');
+                        th.textContent = col.name;
+                        thead.appendChild(th);
+                    });
+
+                    // Add matched keywords column if present
+                    if (data.columns && data.columns.includes('Matched Keywords')) {
+                        const th = document.createElement('th');
+                        th.textContent = 'Matched Keywords';
+                        th.style.backgroundColor = '#fff3cd';
+                        thead.appendChild(th);
+                    }
+
+                    // Add annotation columns - this is the key part
                     if (data.columns && data.columns.length > 0) {
-                        const thead = document.querySelector('#abstractsTable thead tr');
-                        thead.innerHTML = '';
-                        
-                        // Add standard columns for SITC
-                        const standardColumns = [
-                            {name: 'Abstract #', field: 'Abstract #'},
-                            {name: 'Keywords', field: 'Keywords'},
-                            {name: 'Primary Category', field: 'Primary Category'},
-                            {name: 'Presentation Type', field: 'Presentation Type'},
-                            {name: 'Author', field: 'First Author'},
-                            {name: 'Abstract Title', field: 'Abstract title'},
-                            {name: 'Abstract', field: 'Abstract'},
-                            {name: 'Link', field: 'Link'}
-                        ];
-                        
-                        standardColumns.forEach(col => {
-                            const th = document.createElement('th');
-                            th.textContent = col.name;
-                            thead.appendChild(th);
-                        });
-                        
-                        // Add matched keywords column if present
-                        if (data.columns.includes('Matched Keywords')) {
-                            const th = document.createElement('th');
-                            th.textContent = 'Matched Keywords';
-                            th.style.backgroundColor = '#fff3cd';
-                            thead.appendChild(th);
-                        }
-                        
-                        // Add annotation columns
                         data.columns.forEach(col => {
                             if (col.startsWith('Answer:')) {
                                 const th = document.createElement('th');
@@ -1109,15 +1111,17 @@ HTML_TEMPLATE = """
 
                         tr.innerHTML = html;
 
-                        // Add annotation columns
-                        data.columns.forEach(col => {
-                            if (col.startsWith('Answer:')) {
-                                const td = document.createElement('td');
-                                td.textContent = row[col] || '-';
-                                td.style.backgroundColor = '#f1f8e9';
-                                tr.appendChild(td);
-                            }
-                        });
+                        // Add annotation columns - ensure they're always added if present
+                        if (data.columns && data.columns.length > 0) {
+                            data.columns.forEach(col => {
+                                if (col.startsWith('Answer:')) {
+                                    const td = document.createElement('td');
+                                    td.textContent = row[col] || '-';
+                                    td.style.backgroundColor = '#f1f8e9';
+                                    tr.appendChild(td);
+                                }
+                            });
+                        }
 
                         // Store row data for modal access
                         if (hasAbstract) {
