@@ -612,8 +612,9 @@ HTML_TEMPLATE = """
                     </div>
                     
                     <div class="control-group">
-                        <label for="numThreads">Number of Threads:</label>
-                        <input type="number" id="numThreads" min="1" max="200" value="100">
+                        <label for="numThreads">Number of Threads (max 20):</label>
+                        <input type="number" id="numThreads" min="1" max="20" value="20">
+                        <small style="color: #666; display: block; margin-top: 5px;">Capped at 20 for stability</small>
                     </div>
                     
                     <div class="control-group">
@@ -1267,6 +1268,11 @@ CORS(app)
 TEMP_DIR = os.path.join(tempfile.gettempdir(), 'conference-webapp-tasks')
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+# In-memory progress tracking for active tasks (reduces file I/O)
+# Key: task_id, Value: {'completed': count, 'total': total, 'last_sync': timestamp}
+active_tasks = {}
+active_tasks_lock = threading.Lock()
+
 # File-based storage functions for multi-worker compatibility
 def get_progress_file(task_id):
     """Get the file path for storing progress data"""
@@ -1282,12 +1288,33 @@ def save_progress(task_id, progress_data):
         json.dump(progress_data, f)
 
 def load_progress(task_id):
-    """Load progress data from file"""
+    """Load progress data (checks memory first, then file)"""
+    # Check in-memory first (much faster for active tasks)
+    with active_tasks_lock:
+        if task_id in active_tasks:
+            task_data = active_tasks[task_id]
+            return {
+                'completed': task_data['completed'],
+                'total': task_data['total'],
+                'status': task_data.get('status', 'running'),
+                'question': task_data.get('question', '')
+            }
+
+    # Fall back to file for completed/old tasks
     progress_file = get_progress_file(task_id)
     if not os.path.exists(progress_file):
         return None
-    with open(progress_file, 'r') as f:
-        return json.load(f)
+
+    # Simple file read with minimal locking for reliability
+    try:
+        with open(progress_file, 'r') as f:
+            content = f.read()
+            if not content or content.strip() == '':
+                return None
+            return json.loads(content)
+    except (IOError, OSError, json.JSONDecodeError) as e:
+        # File might be mid-write, return None gracefully
+        return None
 
 def save_results(task_id, dataframe):
     """Save results dataframe to file"""
@@ -1302,45 +1329,101 @@ def load_results(task_id):
     with open(results_file, 'rb') as f:
         return pickle.load(f)
 
-def update_progress_completed(task_id):
-    """Atomically increment the completed count"""
-    # Simple file locking approach using a lock file
-    lock_file = get_progress_file(task_id) + '.lock'
+def increment_progress_memory(task_id):
+    """Increment progress counter in memory (fast, no file I/O)"""
+    should_sync = False
 
-    # Try to acquire lock with timeout
-    max_attempts = 50
-    for _ in range(max_attempts):
-        try:
-            # Try to create lock file exclusively
-            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            break
-        except FileExistsError:
-            time.sleep(0.01)  # Wait 10ms and retry
-    else:
-        # Couldn't acquire lock, just continue
-        pass
+    with active_tasks_lock:
+        if task_id in active_tasks:
+            active_tasks[task_id]['completed'] += 1
 
+            # Batch sync to disk every 50 completions or if 5+ seconds since last sync
+            completed = active_tasks[task_id]['completed']
+            last_sync = active_tasks[task_id].get('last_sync', 0)
+            current_time = time.time()
+
+            should_sync = (
+                completed % 50 == 0 or  # Every 50 completions
+                (current_time - last_sync) >= 5  # Or every 5 seconds
+            )
+
+    # Call sync OUTSIDE the lock to prevent deadlock
+    if should_sync:
+        sync_progress_to_disk(task_id)
+
+def sync_progress_to_disk(task_id):
+    """Sync in-memory progress to disk (called periodically, not per-item)"""
+    if task_id not in active_tasks:
+        return
+
+    progress_file = get_progress_file(task_id)
+    temp_file = progress_file + '.tmp'
+
+    # Copy data while holding lock briefly
+    with active_tasks_lock:
+        if task_id not in active_tasks:
+            return
+        task_data = active_tasks[task_id].copy()
+
+    progress_data = {
+        'completed': task_data['completed'],
+        'total': task_data['total'],
+        'status': task_data.get('status', 'running'),
+        'question': task_data.get('question', '')
+    }
+
+    # Write to temp file then rename (atomic on Unix)
     try:
-        # Load progress
-        progress = load_progress(task_id)
-        if progress:
-            progress['completed'] += 1
-            save_progress(task_id, progress)
-    finally:
-        # Release lock
+        with open(temp_file, 'w') as f:
+            json.dump(progress_data, f)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Atomic rename
+        os.rename(temp_file, progress_file)
+
+        # Update last sync time
+        with active_tasks_lock:
+            if task_id in active_tasks:
+                active_tasks[task_id]['last_sync'] = time.time()
+    except Exception as e:
+        # Clean up temp file if it exists
         try:
-            os.unlink(lock_file)
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
         except:
             pass
 
 def cleanup_old_tasks():
-    """Clean up task files older than 24 hours"""
+    """Clean up task files older than 24 hours and orphaned temp files"""
     try:
         cutoff_time = time.time() - (24 * 60 * 60)  # 24 hours ago
+        current_time = time.time()
+
         for filename in os.listdir(TEMP_DIR):
             filepath = os.path.join(TEMP_DIR, filename)
-            if os.path.isfile(filepath) and os.path.getmtime(filepath) < cutoff_time:
+            if not os.path.isfile(filepath):
+                continue
+
+            # Clean up orphaned .tmp files older than 1 minute
+            if filename.endswith('.tmp'):
+                try:
+                    if os.path.getmtime(filepath) < (current_time - 60):
+                        os.unlink(filepath)
+                except:
+                    pass
+                continue
+
+            # Clean up old .lock files immediately (from old implementation)
+            if filename.endswith('.lock'):
+                try:
+                    os.unlink(filepath)
+                except:
+                    pass
+                continue
+
+            # Clean up old task files
+            if os.path.getmtime(filepath) < cutoff_time:
                 try:
                     os.unlink(filepath)
                 except:
@@ -1482,7 +1565,7 @@ def process_abstracts_batch(task_id, abstracts_batch, api_key, model, question, 
             })
         finally:
             # Always update progress, even if there's an error
-            update_progress_completed(task_id)
+            increment_progress_memory(task_id)
 
     return results
 
@@ -1564,6 +1647,12 @@ def annotate_abstracts():
     model = data.get('model', 'gpt-3.5-turbo')
     question = data.get('question')
     num_threads = int(data.get('num_threads', 4))
+
+    # Cap threads at 20 to prevent "too many open files" errors
+    # Even with high ulimit, ThreadPoolExecutor can exhaust file descriptors
+    # with HTTP connections, temp files, and thread overhead
+    num_threads = min(num_threads, 20)
+
     dry_run = data.get('dry_run', False)
     search_filter = data.get('search_filter', '')
     show_empty = data.get('show_empty', False)
@@ -1603,8 +1692,20 @@ def annotate_abstracts():
         
         filtered_df = filtered_df[mask]
     
-    # Initialize progress tracking with file-based storage
+    # Initialize progress tracking
     total_abstracts = len(filtered_df)
+
+    # Initialize in-memory tracking (fast)
+    with active_tasks_lock:
+        active_tasks[task_id] = {
+            'completed': 0,
+            'total': total_abstracts,
+            'status': 'running',
+            'question': question,
+            'last_sync': time.time()
+        }
+
+    # Also save to disk initially
     progress_data = {
         'total': total_abstracts,
         'completed': 0,
@@ -1652,11 +1753,19 @@ def annotate_abstracts():
         # Store results in file
         save_results(task_id, result_df)
 
-        # Update progress status
-        progress = load_progress(task_id)
-        if progress:
-            progress['status'] = 'completed'
-            save_progress(task_id, progress)
+        # Mark as completed in memory and ensure count is at 100%
+        with active_tasks_lock:
+            if task_id in active_tasks:
+                # Ensure completed count matches total
+                active_tasks[task_id]['completed'] = active_tasks[task_id]['total']
+                active_tasks[task_id]['status'] = 'completed'
+
+        # Do final sync to disk (OUTSIDE the lock to prevent deadlock)
+        sync_progress_to_disk(task_id)
+
+        # Clean up from memory after a short delay (allow final reads)
+        with active_tasks_lock:
+            threading.Timer(10.0, lambda: active_tasks.pop(task_id, None)).start()
     
     # Start annotation in background thread
     thread = threading.Thread(target=run_annotation)
