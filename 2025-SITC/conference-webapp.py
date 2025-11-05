@@ -18,8 +18,10 @@ import threading
 import time
 import random
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
+import tempfile
+import pickle
 
 # HTML Template embedded as string
 HTML_TEMPLATE = """
@@ -1261,9 +1263,92 @@ HTML_TEMPLATE = """
 app = Flask(__name__)
 CORS(app)
 
-# Global variables for progress tracking
-annotation_progress = {}
-annotation_results = {}
+# Create temporary directory for storing task data (shared across workers)
+TEMP_DIR = os.path.join(tempfile.gettempdir(), 'conference-webapp-tasks')
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# File-based storage functions for multi-worker compatibility
+def get_progress_file(task_id):
+    """Get the file path for storing progress data"""
+    return os.path.join(TEMP_DIR, f"progress_{task_id}.json")
+
+def get_results_file(task_id):
+    """Get the file path for storing results dataframe"""
+    return os.path.join(TEMP_DIR, f"results_{task_id}.pkl")
+
+def save_progress(task_id, progress_data):
+    """Save progress data to file"""
+    with open(get_progress_file(task_id), 'w') as f:
+        json.dump(progress_data, f)
+
+def load_progress(task_id):
+    """Load progress data from file"""
+    progress_file = get_progress_file(task_id)
+    if not os.path.exists(progress_file):
+        return None
+    with open(progress_file, 'r') as f:
+        return json.load(f)
+
+def save_results(task_id, dataframe):
+    """Save results dataframe to file"""
+    with open(get_results_file(task_id), 'wb') as f:
+        pickle.dump(dataframe, f)
+
+def load_results(task_id):
+    """Load results dataframe from file"""
+    results_file = get_results_file(task_id)
+    if not os.path.exists(results_file):
+        return None
+    with open(results_file, 'rb') as f:
+        return pickle.load(f)
+
+def update_progress_completed(task_id):
+    """Atomically increment the completed count"""
+    # Simple file locking approach using a lock file
+    lock_file = get_progress_file(task_id) + '.lock'
+
+    # Try to acquire lock with timeout
+    max_attempts = 50
+    for _ in range(max_attempts):
+        try:
+            # Try to create lock file exclusively
+            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            time.sleep(0.01)  # Wait 10ms and retry
+    else:
+        # Couldn't acquire lock, just continue
+        pass
+
+    try:
+        # Load progress
+        progress = load_progress(task_id)
+        if progress:
+            progress['completed'] += 1
+            save_progress(task_id, progress)
+    finally:
+        # Release lock
+        try:
+            os.unlink(lock_file)
+        except:
+            pass
+
+def cleanup_old_tasks():
+    """Clean up task files older than 24 hours"""
+    try:
+        cutoff_time = time.time() - (24 * 60 * 60)  # 24 hours ago
+        for filename in os.listdir(TEMP_DIR):
+            filepath = os.path.join(TEMP_DIR, filename)
+            if os.path.isfile(filepath) and os.path.getmtime(filepath) < cutoff_time:
+                try:
+                    os.unlink(filepath)
+                except:
+                    pass
+    except:
+        pass
+
+# Lock for thread-safe operations within a single worker
 progress_lock = threading.Lock()
 
 # Load data at startup
@@ -1323,6 +1408,9 @@ def load_data():
 
 # Initialize data
 abstracts_df = load_data()
+
+# Clean up old task files on startup
+cleanup_old_tasks()
 
 def get_openai_response(api_key, model, abstract_text, question, dry_run=False):
     """Get response from OpenAI API or generate mock response for dry run"""
@@ -1394,8 +1482,7 @@ def process_abstracts_batch(task_id, abstracts_batch, api_key, model, question, 
             })
         finally:
             # Always update progress, even if there's an error
-            with progress_lock:
-                annotation_progress[task_id]['completed'] += 1
+            update_progress_completed(task_id)
 
     return results
 
@@ -1516,14 +1603,15 @@ def annotate_abstracts():
         
         filtered_df = filtered_df[mask]
     
-    # Initialize progress tracking
+    # Initialize progress tracking with file-based storage
     total_abstracts = len(filtered_df)
-    annotation_progress[task_id] = {
+    progress_data = {
         'total': total_abstracts,
         'completed': 0,
         'status': 'running',
         'question': question
     }
+    save_progress(task_id, progress_data)
     
     # Split abstracts into batches for threading
     abstracts_list = list(filtered_df.iterrows())
@@ -1560,10 +1648,15 @@ def annotate_abstracts():
         
         # Ensure all columns are preserved
         print(f"Result columns after annotation: {list(result_df.columns)}")
-        
-        # Store results
-        annotation_results[task_id] = result_df
-        annotation_progress[task_id]['status'] = 'completed'
+
+        # Store results in file
+        save_results(task_id, result_df)
+
+        # Update progress status
+        progress = load_progress(task_id)
+        if progress:
+            progress['status'] = 'completed'
+            save_progress(task_id, progress)
     
     # Start annotation in background thread
     thread = threading.Thread(target=run_annotation)
@@ -1574,22 +1667,21 @@ def annotate_abstracts():
 @app.route('/api/progress/<task_id>')
 def get_progress(task_id):
     """Get annotation progress"""
-    if task_id not in annotation_progress:
+    progress = load_progress(task_id)
+    if not progress:
         return jsonify({'error': 'Task not found'}), 404
-    
-    progress = annotation_progress[task_id]
+
     return jsonify(progress)
 
 @app.route('/api/annotated/<task_id>')
 def get_annotated_results(task_id):
     """Get annotated results for display in table"""
-    if task_id not in annotation_results:
+    result_df = load_results(task_id)
+    if result_df is None:
         return jsonify({'error': 'Results not found'}), 404
-    
+
     page = int(request.args.get('page', 1))
     per_page = int(request.args.get('per_page', 20))
-    
-    result_df = annotation_results[task_id]
     
     # Paginate
     total = len(result_df)
@@ -1681,10 +1773,11 @@ def download_current_view():
 @app.route('/api/download/<task_id>')
 def download_results(task_id):
     """Download annotated results as CSV"""
-    if task_id not in annotation_results:
+    result_df = load_results(task_id)
+    if result_df is None:
         return jsonify({'error': 'Results not found'}), 404
-    
-    result_df = annotation_results[task_id].copy()
+
+    result_df = result_df.copy()
 
     # Reorder columns to match display - SITC columns
     base_cols = ['Abstract #', 'Keywords', 'Primary Category', 'Presentation Type', 'First Author', 'Abstract title', 'Abstract', 'Link']
