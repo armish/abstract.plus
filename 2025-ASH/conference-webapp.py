@@ -616,7 +616,15 @@ HTML_TEMPLATE = """
                         <input type="number" id="numThreads" min="1" max="20" value="20">
                         <small style="color: #666; display: block; margin-top: 5px;">Capped at 20 for stability</small>
                     </div>
-                    
+
+                    <div class="control-group">
+                        <label for="maxAnnotations">Max Abstracts to Annotate:</label>
+                        <input type="number" id="maxAnnotations" min="1" value="500">
+                        <small style="color: #e67e22; display: block; margin-top: 5px; font-weight: 500;">
+                            ⚠️ Annotating large numbers of abstracts can be very costly and time-consuming. Default limit is 500 for safety.
+                        </small>
+                    </div>
+
                     <div class="control-group">
                         <label for="perPage">Results per page:</label>
                         <select id="perPage">
@@ -914,30 +922,44 @@ HTML_TEMPLATE = """
             const apiKey = document.getElementById('apiKey').value.trim();
             const model = document.getElementById('modelSelect').value;
             const numThreads = parseInt(document.getElementById('numThreads').value);
+            const maxAnnotations = parseInt(document.getElementById('maxAnnotations').value);
             const dryRun = document.getElementById('dryRun').checked;
             const searchFilter = document.getElementById('searchInput').value;
             const showEmpty = document.getElementById('showEmptyAbstracts').checked;
-            
+
             if (!question) {
                 showMessage('Please enter a question to ask about the abstracts', 'error');
                 return;
             }
-            
+
             if (!dryRun && !apiKey) {
                 showMessage('Please enter your OpenAI API key or enable dry run', 'error');
                 return;
             }
-            
+
+            // Check if the number of abstracts exceeds the max annotation limit
+            if (currentFilteredTotal > maxAnnotations) {
+                const estimatedTime = Math.ceil(currentFilteredTotal / numThreads / 2);
+                showMessage(
+                    `Cannot annotate ${currentFilteredTotal} abstracts - exceeds safety limit of ${maxAnnotations}. ` +
+                    `This would require ${currentFilteredTotal} API calls and take approximately ${estimatedTime} minutes. ` +
+                    `Please either: (1) Refine your search to reduce results, or (2) Increase "Max Abstracts to Annotate" in Advanced Settings if you need to process more abstracts.`,
+                    'error'
+                );
+                return;
+            }
+
             // Show progress container
             document.getElementById('progressContainer').style.display = 'block';
             document.getElementById('progressFill').style.width = '0%';
             document.getElementById('progressFill').textContent = '0%';
-            
+
             const requestData = {
                 question: question,
                 api_key: apiKey,
                 model: model,
                 num_threads: numThreads,
+                max_annotations: maxAnnotations,
                 dry_run: dryRun,
                 search_filter: searchFilter,
                 show_empty: showEmpty
@@ -1667,42 +1689,47 @@ def annotate_abstracts():
     dry_run = data.get('dry_run', False)
     search_filter = data.get('search_filter', '')
     show_empty = data.get('show_empty', False)
-    
+    max_annotations = int(data.get('max_annotations', 500))
+
     # Generate task ID
     task_id = hashlib.md5(f"{question}{datetime.now()}".encode()).hexdigest()
-    
+
     # Filter abstracts if needed
     filtered_df = abstracts_df.copy()
-    
+
     # Apply the same filters as the display
     if not show_empty and 'Abstract' in filtered_df.columns:
         filtered_df = filtered_df[
             (filtered_df['Abstract'].notna()) & (filtered_df['Abstract'] != '')
         ]
-    
+
     if search_filter:
         # Split search terms by semicolon
         search_terms = [term.strip() for term in search_filter.split(';') if term.strip()]
-        
+
         # Create matched keywords column
         filtered_df['Matched Keywords'] = ''
-        
+
         # Filter rows that match any of the search terms
         mask = pd.Series([False] * len(filtered_df))
-        
+
         for term in search_terms:
             term_mask = filtered_df.apply(lambda row: row.astype(str).str.contains(term, case=False).any(), axis=1)
             mask = mask | term_mask
-            
+
             # Track which keywords matched
             for idx in filtered_df[term_mask].index:
                 if filtered_df.loc[idx, 'Matched Keywords']:
                     filtered_df.loc[idx, 'Matched Keywords'] += '; ' + term
                 else:
                     filtered_df.loc[idx, 'Matched Keywords'] = term
-        
+
         filtered_df = filtered_df[mask]
-    
+
+    # Apply max annotation limit (backend enforcement for safety)
+    if len(filtered_df) > max_annotations:
+        filtered_df = filtered_df.head(max_annotations)
+
     # Initialize progress tracking
     total_abstracts = len(filtered_df)
 
