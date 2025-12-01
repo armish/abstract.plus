@@ -694,6 +694,19 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
+    <!-- Footer -->
+    <footer style="background-color: #2c3e50; color: #ecf0f1; padding: 20px 0; margin-top: 40px; text-align: center;">
+        <div class="container">
+            <p style="margin-bottom: 8px;">
+                This is an open-source project. Source code and materials are available at
+                <a href="https://github.com/armish/abstract.plus/" target="_blank" style="color: #3498db; text-decoration: none;">github.com/armish/abstract.plus</a>
+            </p>
+            <p style="font-size: 0.85rem; color: #bdc3c7;">
+                Feedback, issues, and contributions are welcome on our GitHub repository.
+            </p>
+        </div>
+    </footer>
+
     <!-- Abstract Modal -->
     <div id="abstractModal" class="modal">
         <div class="modal-content">
