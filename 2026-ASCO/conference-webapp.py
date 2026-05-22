@@ -1570,17 +1570,38 @@ def load_data():
             'Abstract Number': 'Abstract ID',
         })
 
-        # Clean data
-        for col in df.columns:
-            if df[col].dtype == 'object':
-                df[col] = df[col].fillna('')
-            else:
-                df[col] = df[col].fillna(0)
+        # Force text-display columns to string with '' for missing values.
+        # Some pandas/openpyxl combinations infer numeric-looking ASCO
+        # columns (e.g. Abstract Number) as floats, which would otherwise
+        # bypass the generic fillna('') branch below and break both the
+        # empty-row filter and the natural-numeric sort.
+        text_cols = ['Abstract', 'Abstract ID', 'Abstract link', 'Authors',
+                     'Title', 'Presenter', 'Session Title', 'Session Type',
+                     'Primary Track', 'First Author', 'First Author Org',
+                     'DOI', 'Journal Citation',
+                     'Clinical Trial Registry Number']
+        for col in text_cols:
+            if col not in df.columns:
+                continue
+            s = df[col]
+            df[col] = s.where(s.notna(), '').astype(str)
+            df.loc[df[col].str.lower() == 'nan', col] = ''
+            if col == 'Abstract ID':
+                df[col] = df[col].str.replace(r'\.0$', '', regex=True)
 
         # Treat dash-only abstract bodies as empty so they get filtered out
         # by the "show rows without abstract text" toggle.
         if 'Abstract' in df.columns:
-            df.loc[df['Abstract'].astype(str).str.strip() == '-', 'Abstract'] = ''
+            df.loc[df['Abstract'].str.strip() == '-', 'Abstract'] = ''
+
+        # Clean remaining columns
+        for col in df.columns:
+            if col in text_cols:
+                continue
+            if df[col].dtype == 'object':
+                df[col] = df[col].fillna('')
+            else:
+                df[col] = df[col].fillna(0)
 
         # Sort by Abstract ID: numeric values ascending first, then any
         # alphanumeric abstract numbers (LBA*, TPS*, e*), empties last.
