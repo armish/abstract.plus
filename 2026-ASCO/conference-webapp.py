@@ -628,7 +628,7 @@ HTML_TEMPLATE = """
                     </div>
                     
                     <div class="checkbox-group">
-                        <input type="checkbox" id="showEmptyAbstracts" checked>
+                        <input type="checkbox" id="showEmptyAbstracts">
                         <label for="showEmptyAbstracts">Show rows without abstract text</label>
                     </div>
                 </div>
@@ -1576,6 +1576,11 @@ def load_data():
                 df[col] = df[col].fillna('')
             else:
                 df[col] = df[col].fillna(0)
+
+        # Treat dash-only abstract bodies as empty so they get filtered out
+        # by the "show rows without abstract text" toggle.
+        if 'Abstract' in df.columns:
+            df.loc[df['Abstract'].astype(str).str.strip() == '-', 'Abstract'] = ''
 
         # Sort by Abstract ID: numeric values ascending first, then any
         # alphanumeric abstract numbers (LBA*, TPS*, e*), empties last.
